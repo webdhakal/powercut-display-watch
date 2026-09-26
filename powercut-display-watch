@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Watches the laptop charger. The BenQ monitor and the charger share mains power,
+# so "charger offline" == power cut == monitor is dead (even though HDMI still
+# reports "connected", which is why GNOME never notices on its own).
+#
+#   power cut      -> mirror displays (laptop screen shows everything),
+#                     audio -> laptop speakers
+#   power restored -> extended layout (monitor primary on the right),
+#                     audio -> HDMI (monitor's speakers)
+
+AC=/sys/class/power_supply/ACAD/online
+CARD=alsa_card.pci-0000_00_1f.3
+PY=/usr/bin/python3          # system python; miniconda's lacks the gi module gdctl needs
+gdctl() { "$PY" /usr/bin/gdctl "$@"; }
+RESTORE_DELAY=5              # seconds to let the monitor wake up after power returns
+
+log() { echo "$(date '+%F %T') $*"; }
+
+set_audio_profile() {   # $1 = profile name
+    local ids=()
+    read -ra ids < <(pw-dump | "$PY" -c '
+import json, sys
+card, want = sys.argv[1], sys.argv[2]
+for o in json.load(sys.stdin):
+    if o.get("type") == "PipeWire:Interface:Device" and o["info"]["props"].get("device.name") == card:
+        for p in o["info"]["params"].get("EnumProfile", []):
+            if p.get("name") == want:
+                print(o["id"], p["index"])
+' "$CARD" "$1")
+    if (( ${#ids[@]} == 2 )); then
+        wpctl set-profile "${ids[@]}" && log "audio profile -> $1"
+    else
+        log "audio profile $1 not found"
+    fi
+}
+
+on_battery() {
+    log "power cut: mirroring + laptop speakers"
+    gdctl set -L --primary --scale 1.25 -M eDP-1 -M HDMI-1 || log "gdctl mirror failed"
+    set_audio_profile "output:analog-stereo+input:analog-stereo"
+}
+
+on_ac() {
+    log "power back: extended + monitor speakers"
+    sleep "$RESTORE_DELAY"
+    gdctl set -L --scale 1.25 --x 0 --y 362 -M eDP-1 \
+               -L --primary --scale 1 --x 1536 --y 0 -M HDMI-1 || log "gdctl extend failed"
+    set_audio_profile "output:hdmi-stereo+input:analog-stereo"
+}
+
+prev=""
+while true; do
+    cur=$(cat "$AC" 2>/dev/null)
+    if [[ -n $cur && $cur != "$prev" ]]; then
+        # Skip acting on the first read at startup when already on AC (normal state).
+        if [[ $cur == 0 ]]; then on_battery
+        elif [[ -n $prev ]]; then on_ac
+        fi
+        prev=$cur
+    fi
+    sleep 2
+done
