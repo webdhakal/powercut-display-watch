@@ -1,62 +1,261 @@
-#!/usr/bin/env bash
-# Watches the laptop charger. The BenQ monitor and the charger share mains power,
-# so "charger offline" == power cut == monitor is dead (even though HDMI still
-# reports "connected", which is why GNOME never notices on its own).
-#
-#   power cut      -> mirror displays (laptop screen shows everything),
-#                     audio -> laptop speakers
-#   power restored -> extended layout (monitor primary on the right),
-#                     audio -> HDMI (monitor's speakers)
+#!/usr/bin/python3
+"""Power-cut recovery for Linux Mint / Cinnamon on X11."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import time
 
-AC=/sys/class/power_supply/ACAD/online
-CARD=alsa_card.pci-0000_00_1f.3
-PY=/usr/bin/python3          # system python; miniconda's lacks the gi module gdctl needs
-gdctl() { "$PY" /usr/bin/gdctl "$@"; }
-RESTORE_DELAY=5              # seconds to let the monitor wake up after power returns
+CARD = os.environ.get('POWERCUT_CARD', 'alsa_card.pci-0000_00_1f.3')
+STATE = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'powercut-display-watch/layout.json'
+DELAY = float(os.environ.get('POWERCUT_RESTORE_DELAY', '5'))
 
-log() { echo "$(date '+%F %T') $*"; }
 
-set_audio_profile() {   # $1 = profile name
-    local ids=()
-    read -ra ids < <(pw-dump | "$PY" -c '
-import json, sys
-card, want = sys.argv[1], sys.argv[2]
-for o in json.load(sys.stdin):
-    if o.get("type") == "PipeWire:Interface:Device" and o["info"]["props"].get("device.name") == card:
-        for p in o["info"]["params"].get("EnumProfile", []):
-            if p.get("name") == want:
-                print(o["id"], p["index"])
-' "$CARD" "$1")
-    if (( ${#ids[@]} == 2 )); then
-        wpctl set-profile "${ids[@]}" && log "audio profile -> $1"
-    else
-        log "audio profile $1 not found"
-    fi
-}
+def log(message):
+    print(time.strftime('%F %T'), message, flush=True)
 
-on_battery() {
-    log "power cut: mirroring + laptop speakers"
-    gdctl set -L --primary --scale 1.25 -M eDP-1 -M HDMI-1 || log "gdctl mirror failed"
-    set_audio_profile "output:analog-stereo+input:analog-stereo"
-}
 
-on_ac() {
-    log "power back: extended + monitor speakers"
-    sleep "$RESTORE_DELAY"
-    gdctl set -L --scale 1.25 --x 0 --y 362 -M eDP-1 \
-               -L --primary --scale 1 --x 1536 --y 0 -M HDMI-1 || log "gdctl extend failed"
-    set_audio_profile "output:hdmi-stereo+input:analog-stereo"
-}
+def run(*args):
+    return subprocess.check_output(args, text=True, stderr=subprocess.PIPE, timeout=15).strip()
 
-prev=""
-while true; do
-    cur=$(cat "$AC" 2>/dev/null)
-    if [[ -n $cur && $cur != "$prev" ]]; then
-        # Skip acting on the first read at startup when already on AC (normal state).
-        if [[ $cur == 0 ]]; then on_battery
-        elif [[ -n $prev ]]; then on_ac
-        fi
-        prev=$cur
-    fi
-    sleep 2
-done
+
+def find_ac(root=Path('/sys/class/power_supply')):
+    override = os.environ.get('POWERCUT_AC')
+    if override:
+        return Path(override)
+    for supply in sorted(root.iterdir()):
+        if (supply / 'type').read_text().strip() == 'Mains' and (supply / 'online').exists():
+            return supply / 'online'
+    raise RuntimeError('No mains charger found in /sys/class/power_supply')
+
+
+def parse_outputs(text):
+    outputs = []
+    current = None
+    for line in text.splitlines():
+        match = re.match(r'^(\S+) connected (primary )?(?:(\d+x\d+)\+(\d+)\+(\d+) )?', line)
+        if match:
+            name, primary, mode, x, y = match.groups()
+            current = {'name': name, 'primary': bool(primary), 'mode': mode,
+                       'pos': f'{x}x{y}' if mode else None, 'rate': None}
+            outputs.append(current)
+            tail = line[match.end():]
+            current['rotation'] = tail.split()[0] if not tail.startswith('(') else 'normal'
+        elif line and not line[0].isspace():
+            current = None
+        elif current and '*' in line:
+            for rate in line.split()[1:]:
+                if '*' in rate:
+                    current['rate'] = rate.strip('*+')
+    return outputs
+
+
+def restore_command(outputs):
+    cmd = ['xrandr']
+    for output in outputs:
+        cmd += ['--output', output['name']]
+        if output['mode']:
+            cmd += ['--mode', output['mode'], '--pos', output['pos'],
+                    '--rotate', output.get('rotation', 'normal')]
+            if output['rate']:
+                cmd += ['--rate', output['rate']]
+            if output['primary']:
+                cmd += ['--primary']
+        else:
+            cmd += ['--off']
+    return cmd
+
+
+def snapshot():
+    outputs = parse_outputs(run('xrandr', '--query'))
+    if not any(o['name'].startswith(('eDP', 'LVDS')) for o in outputs):
+        raise RuntimeError('No laptop display found')
+    card = next(c for c in json.loads(run('pactl', '-f', 'json', 'list', 'cards')) if c['name'] == CARD)
+    sinks = json.loads(run('pactl', '-f', 'json', 'list', 'sinks'))
+    sink = run('pactl', 'get-default-sink')
+    port = next((s.get('active_port') for s in sinks if s['name'] == sink), None)
+    return {'outputs': outputs, 'profile': card['active_profile'], 'sink': sink, 'port': port}
+
+
+def save(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state, indent=2) + '\n')
+    temporary.replace(STATE)
+
+
+def select_sink(sink, port=None):
+    # Profiles create sinks asynchronously in PipeWire.
+    for _ in range(10):
+        sinks = json.loads(run('pactl', '-f', 'json', 'list', 'sinks'))
+        if any(s['name'] == sink for s in sinks):
+            break
+        time.sleep(0.2)
+    if port:
+        run('pactl', 'set-sink-port', sink, port)
+    run('pactl', 'set-default-sink', sink)
+    for stream in json.loads(run('pactl', '-f', 'json', 'list', 'sink-inputs')):
+        try:
+            run('pactl', 'move-sink-input', str(stream['index']), sink)
+        except subprocess.CalledProcessError:
+            pass  # A playing application may have closed in the meantime.
+
+
+def choose_audio(cards, sinks, monitor_allowed):
+    """Choose headphones, available monitor audio, then built-in speakers."""
+    candidates = []
+    headphone_match = os.environ.get('POWERCUT_HEADPHONE_MATCH', 'FANTECH_FUSION').lower()
+
+    def headset_device(name, properties, description=''):
+        words = ' '.join([name, description, properties.get('device.form_factor', ''),
+                          properties.get('device.description', '')]).lower()
+        return ('headphone' in words or 'headset' in words
+                or bool(headphone_match and headphone_match in words))
+
+    # Bluetooth devices already have a connected playback sink. Do not treat
+    # every Bluetooth/USB speaker as a headset.
+    for sink in sinks:
+        if sink['name'].startswith('bluez_output.') and headset_device(
+                sink['name'], sink.get('properties', {}), sink.get('description', '')):
+            candidates.append((0, {'card': None, 'profile': None, 'sink': sink['name'],
+                                   'port': sink.get('active_port'), 'label': 'Bluetooth headphones'}))
+
+    for card in cards:
+        named_headset = headset_device(card['name'], card.get('properties', {}))
+        for port_name, port in card.get('ports', {}).items():
+            availability = port.get('availability', 'availability unknown')
+            if availability in ('not available', 'no'):
+                continue
+            kind = port.get('type', '')
+            if kind in ('Headphones', 'Headset') and availability in ('available', 'yes'):
+                rank, label = 0, 'headphones'
+            elif named_headset and kind in ('Speaker', 'Headphones', 'Headset'):
+                rank, label = 0, 'USB headphones'
+            elif monitor_allowed and kind == 'HDMI' and availability in ('available', 'yes'):
+                rank, label = 1, 'monitor speakers'
+            elif card['name'] == CARD and port_name == 'analog-output-speaker':
+                rank, label = 2, 'laptop speakers'
+            else:
+                continue
+            profiles = [p for p in port.get('profiles', [])
+                        if p.startswith('output:') and 'stereo' in p
+                        and card.get('profiles', {}).get(p, {}).get('available', True) not in (False, 'no')]
+            if not profiles:
+                continue
+            profiles.sort(key=lambda p: (p != card.get('active_profile'), '+' not in p, p))
+            profile = profiles[0]
+            sink_name = card['name'].replace('alsa_card.', 'alsa_output.', 1) + '.' + profile.split('+')[0].split(':', 1)[1]
+            candidates.append((rank, {'card': card['name'], 'profile': profile,
+                                      'sink': sink_name, 'port': port_name, 'label': label}))
+    if not candidates:
+        raise RuntimeError('No usable headphone, monitor or laptop audio output detected')
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def route_audio(monitor_allowed):
+    cards = json.loads(run('pactl', '-f', 'json', 'list', 'cards'))
+    sinks = json.loads(run('pactl', '-f', 'json', 'list', 'sinks'))
+    choice = choose_audio(cards, sinks, monitor_allowed)
+    changed_profile = False
+    if choice['card']:
+        card = next(c for c in cards if c['name'] == choice['card'])
+        if card['active_profile'] != choice['profile']:
+            run('pactl', 'set-card-profile', choice['card'], choice['profile'])
+            changed_profile = True
+    active_sink = next((s for s in sinks if s['name'] == choice['sink']), None)
+    if (changed_profile or run('pactl', 'get-default-sink') != choice['sink']
+            or not active_sink or (choice['port'] and active_sink.get('active_port') != choice['port'])):
+        select_sink(choice['sink'], choice['port'])
+        log(f'Audio -> {choice["label"]}: {choice["sink"]}')
+    return choice
+
+
+def battery(state):
+    outputs = parse_outputs(run('xrandr', '--query'))
+    laptop = next(o for o in outputs if o['name'].startswith(('eDP', 'LVDS')))
+    cmd = ['xrandr', '--output', laptop['name'], '--auto', '--primary', '--pos', '0x0']
+    for output in outputs:
+        if output != laptop:
+            cmd += ['--output', output['name'], '--off']
+    run(*cmd)
+    route_audio(False)
+    log('Power cut: laptop display active')
+
+
+def restore(state, ac):
+    if ac.read_text().strip() != '1':
+        return False
+    connected = {o['name'] for o in parse_outputs(run('xrandr', '--query'))}
+    if any(o['mode'] and o['name'] not in connected for o in state['outputs']):
+        log('Waiting for external display to reconnect')
+        return False
+    run(*restore_command(state['outputs']))
+    route_audio(any(o['mode'] and not o['name'].startswith(('eDP', 'LVDS'))
+                    for o in parse_outputs(run('xrandr', '--query'))))
+    log('Power restored: saved display layout restored')
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='Inspect configuration without changing displays or audio')
+    args = parser.parse_args()
+    if os.environ.get('XDG_SESSION_TYPE', 'x11') != 'x11':
+        raise RuntimeError('This Mint version requires an X11 session')
+    ac = find_ac()
+    initial = snapshot()
+    log(f'Watching {ac}; displays: ' + ', '.join(o['name'] for o in initial['outputs']) + f'; audio: {initial["sink"]}')
+    if args.check:
+        initial['preferred_audio'] = choose_audio(
+            json.loads(run('pactl', '-f', 'json', 'list', 'cards')),
+            json.loads(run('pactl', '-f', 'json', 'list', 'sinks')),
+            ac.read_text().strip() == '1' and any(
+                o['mode'] and not o['name'].startswith(('eDP', 'LVDS'))
+                for o in initial['outputs']))
+        print(json.dumps(initial, indent=2))
+        return
+    state = json.loads(STATE.read_text()) if STATE.exists() else initial
+    previous = None
+    pending = None
+    ready_at = 0
+    while True:
+        try:
+            current = ac.read_text().strip()
+            if current not in ('0', '1'):
+                raise RuntimeError(f'Invalid charger state: {current!r}')
+            if current != previous:
+                if current == '0':
+                    if previous == '1':
+                        state = snapshot()
+                    save(state)
+                    pending = 'battery'
+                elif previous is not None or STATE.exists():
+                    pending = 'restore'
+                    ready_at = time.monotonic() + DELAY
+                previous = current
+            if pending == 'battery':
+                battery(state)
+                pending = None
+            elif pending == 'restore' and time.monotonic() >= ready_at:
+                if restore(state, ac):
+                    STATE.unlink(missing_ok=True)
+                    pending = None
+                else:
+                    ready_at = time.monotonic() + DELAY
+            monitor_allowed = current == '1' and pending is None and any(
+                o['mode'] and not o['name'].startswith(('eDP', 'LVDS'))
+                for o in parse_outputs(run('xrandr', '--query')))
+            route_audio(monitor_allowed)
+        except (OSError, ValueError, RuntimeError, StopIteration, subprocess.SubprocessError) as error:
+            log(f'Retrying after error: {error}')
+        time.sleep(2)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, StopIteration, subprocess.SubprocessError) as error:
+        log(f'Cannot start: {error}')
+        raise SystemExit(1)

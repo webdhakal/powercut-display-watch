@@ -1,93 +1,83 @@
-# powercut-display-watch
+# powercut-display-watch — Linux Mint
 
-Automatically switches a laptop + external monitor setup to **mirror mode with laptop speakers** during a power cut, and restores the **extended layout with monitor speakers** when power returns.
+Power-cut recovery for **Linux Mint 22.3, Cinnamon on X11**, using
+`xrandr` and `pactl` (PulseAudio or PipeWire's PulseAudio compatibility server).
+This version replaces the original GNOME/Wayland-specific setup.
 
-Built for Ubuntu (GNOME on Wayland) with PipeWire / WirePlumber audio.
+The laptop charger and external monitor must share mains power. Unplugging the
+charger manually also triggers recovery.
 
-## The problem
-
-Setup: a laptop plus an external monitor over HDMI. The monitor is the primary display in extended mode, and speakers are plugged into the monitor's 3.5 mm jack.
-
-When the power goes out, the monitor dies but the laptop keeps running on battery. The laptop still reports the HDMI port as **connected**, because the HDMI cable carries a little power from the laptop itself. GNOME never notices the monitor is gone, so windows and sound stay on the dead monitor. The only workaround was unplugging the HDMI cable by hand.
-
-## How it works
-
-The monitor and the laptop charger are on the same mains power, so **"charger offline" means "power cut"**. The script checks `/sys/class/power_supply/ACAD/online` every 2 seconds:
-
-| Event | Display | Audio |
-|---|---|---|
-| Charger goes offline (power cut) | Mirror laptop + monitor | Laptop speakers |
-| Charger comes back (power restored) | Extended, monitor primary on the right (after a 5 s delay so the monitor can wake up) | HDMI → monitor speakers |
-
-- The display layout is set with `gdctl`, GNOME's display config tool.
-- Audio is switched with `wpctl set-profile`, which changes the sound card profile.
-- It runs as a systemd **user** service, so it starts automatically at every login.
-
-## Files
-
-| File | Installed to |
-|---|---|
-| `powercut-display-watch` | `~/.local/bin/powercut-display-watch` |
-| `powercut-display-watch.service` | `~/.config/systemd/user/powercut-display-watch.service` |
-| `install.sh` | Copies both files above and enables the service |
+* On battery: enable the laptop screen at (0, 0), make it primary, disable
+  external displays, use connected headphones or fall back to the built-in speakers, and move playing audio.
+  Disabling the dead display keeps windows accessible on the laptop.
+* On AC: wait five seconds for the monitor, then restore the display positions,
+  resolutions, refresh rates, rotations and primary display captured before the
+  outage. Select headphones first, then available monitor speakers, then laptop speakers.
+  Move playing audio to the selected output.
+* Detect the charger's `Mains` power supply automatically (`ADP0` on this laptop).
+* Check audio connections every two seconds, including while already on AC.
+  Wired headphones must report their jack as available. Bluetooth headphones
+  are recognized by headset/headphone device metadata. The FANTECH FUSION USB
+  headset is explicitly recognized because it reports its port as “Speakers”.
+* Retry failed recovery operations and wait for disconnected monitors to return.
+* Keep the outage snapshot under `~/.local/state/powercut-display-watch/` so
+  a watcher restart during an outage does not lose the normal layout.
 
 ## Install
 
+Run inside your Cinnamon desktop session, without sudo:
+
 ```bash
-git clone <your-repo-url> powercut-display-watch
-cd powercut-display-watch
 ./install.sh
 ```
 
-## Usage
+The installer checks the live setup before changing files. It installs the
+watcher in `~/.local/bin`, a systemd user service, and a Cinnamon-compatible
+login entry in `~/.config/autostart/powercut-display-watch.desktop`. The login
+entry imports the desktop's X11 environment and restarts the user service.
+No additional packages are needed on this system.
 
-Check that it's running:
+## Check and test
 
 ```bash
+./powercut-display-watch --check   # Read-only live configuration check
+python3 test_watch.py             # Regression tests
 systemctl --user status powercut-display-watch.service
+journalctl --user -u powercut-display-watch.service -f
 ```
 
-Watch it react live (unplug the charger to test):
+Unplug the laptop charger while keeping the external display attached. The
+laptop screen and speakers should take over within about two seconds. Reconnect
+the charger; the prior arrangement should return after approximately five
+seconds, or later if the monitor needs more time to reconnect.
 
-```bash
-journalctl --user -u powercut-display-watch -f
-```
+The `--check` command is read-only and also prints the preferred audio output.
+On startup, the service applies the audio priority without changing the AC display layout.
+A saved, unfinished outage is recovered after a restart on AC.
 
-Stop and disable it:
+## Configuration
+
+Optional environment variables (set via `systemctl --user edit
+powercut-display-watch.service`, under `[Service]` with `Environment=...`):
+
+* `POWERCUT_AC`: override the detected charger `online` file.
+* `POWERCUT_CARD`: built-in sound card; default `alsa_card.pci-0000_00_1f.3`.
+* `POWERCUT_HEADPHONE_MATCH`: extra device-name match for USB headphones that
+  report themselves as speakers; default `FANTECH_FUSION`. Generic USB speakers
+  are not automatically classified as headphones.
+* `POWERCUT_RESTORE_DELAY`: monitor wake-up delay in seconds; default `5`.
+
+This setup expects an eDP or LVDS laptop screen and standard analog speaker
+profiles. Arbitrary Xrandr scaling/transforms and multi-user concurrent graphical
+sessions are outside this version's scope. It runs while your user session is
+active, not on the login screen.
+
+## Disable
 
 ```bash
 systemctl --user disable --now powercut-display-watch.service
+mv ~/.config/autostart/powercut-display-watch.desktop \
+   ~/.config/autostart/powercut-display-watch.desktop.disabled
 ```
 
-## Customising
-
-The settings are at the top of the script and in the two `gdctl set` lines:
-
-| Setting | Current value | How to find yours |
-|---|---|---|
-| `AC` | `/sys/class/power_supply/ACAD/online` | `ls /sys/class/power_supply/` (look for type `Mains`) |
-| `CARD` | `alsa_card.pci-0000_00_1f.3` | `wpctl status`, then `wpctl inspect <device id>` → `device.name` |
-| Connectors | `eDP-1` (laptop), `HDMI-1` (monitor) | `/usr/bin/python3 /usr/bin/gdctl show` |
-| Extended layout | laptop at scale 1.25, position (0, 362); monitor at scale 1, position (1536, 0), primary | Arrange your displays in Settings → Displays, then read the values from `gdctl show` |
-| `RESTORE_DELAY` | `5` seconds | Increase it if your monitor takes longer to wake up |
-
-After editing, run `./install.sh` again.
-
-To dry-run a layout without applying it, add `-V`:
-
-```bash
-/usr/bin/python3 /usr/bin/gdctl set -V -L --primary --scale 1.25 -M eDP-1 -M HDMI-1
-```
-
-## Notes
-
-- **Unplugging the charger by hand triggers it too.** The laptop can't tell a power cut from a pulled charger.
-- **It only acts while you're logged in.** A power cut on the login screen isn't handled.
-- **Laptop speaker volume.** The laptop speakers use their own volume setting. Set it once while they're active and it should stay at that level.
-- **Why `/usr/bin/python3`?** `gdctl` needs the system Python's `gi` module. A conda or other Python first on `PATH` breaks it, so the script calls the system Python directly.
-
-## Requirements
-
-- GNOME 48+ on Wayland (for `gdctl`)
-- PipeWire + WirePlumber (`wpctl`, `pw-dump`)
-- systemd user session
+Both steps are needed because Cinnamon's login entry also starts the service.

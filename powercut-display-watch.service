@@ -1,7 +1,6 @@
 [Unit]
-Description=Mirror displays and switch audio to laptop on power cut
-After=graphical-session.target pipewire.service wireplumber.service
-PartOf=graphical-session.target
+Description=Recover laptop display and audio during a power cut
+After=pipewire.service wireplumber.service
 
 [Service]
 ExecStart=%h/.local/bin/powercut-display-watch
@@ -9,4 +8,4 @@ Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target
