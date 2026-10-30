@@ -10,16 +10,20 @@ charger manually also triggers recovery.
 * On battery: enable the laptop screen at (0, 0), make it primary, disable
   external displays, use connected headphones or fall back to the built-in speakers, and move playing audio.
   Disabling the dead display keeps windows accessible on the laptop.
+  After this initial switch, you can choose another output in system Sound
+  settings (including the laptop speakers); your choice stays until AC returns.
 * On AC: wait five seconds for the monitor, then restore the display positions,
   resolutions, refresh rates, rotations and primary display captured before the
   outage. Select headphones first, then available monitor speakers, then laptop speakers.
   Move playing audio to the selected output.
 * Detect the charger's `Mains` power supply automatically (`ADP0` on this laptop).
-* Check audio connections every two seconds, including while already on AC.
+* Check audio connections every two seconds while on AC.
   Wired headphones must report their jack as available. Bluetooth headphones
   are recognized by headset/headphone device metadata. The FANTECH FUSION USB
   headset is explicitly recognized because it reports its port as “Speakers”.
 * Retry failed recovery operations and wait for disconnected monitors to return.
+  Display recovery is independent of audio: an unavailable external sound
+  device or sound-server error cannot prevent the laptop screen taking over.
 * Keep the outage snapshot under `~/.local/state/powercut-display-watch/` so
   a watcher restart during an outage does not lose the normal layout.
 

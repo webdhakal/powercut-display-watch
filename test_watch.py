@@ -1,9 +1,10 @@
 import importlib.machinery
 import importlib.util
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 class WatchTests(unittest.TestCase):
     def setUp(self):
@@ -46,6 +47,44 @@ HDMI-1 disconnected (normal left inverted right x axis y axis)
         with patch.object(self.w, 'run') as run:
             self.assertFalse(self.w.restore({'outputs': [], 'profile': '', 'sink': ''}, ac))
             run.assert_not_called()
+
+    def test_display_snapshot_does_not_depend_on_audio(self):
+        def run(*args):
+            if args[0] == 'pactl':
+                raise subprocess.CalledProcessError(1, args)
+            return 'eDP-1 connected primary 1920x1080+0+0 (normal)\nDP-1 connected 1920x1080+1920+0 (normal)'
+
+        with patch.object(self.w, 'run', side_effect=run):
+            try:
+                state = self.w.snapshot()
+            except subprocess.SubprocessError:
+                self.fail('Audio failure prevented saving the display layout')
+        self.assertEqual([o['name'] for o in state['outputs']], ['eDP-1', 'DP-1'])
+
+    def test_outage_display_completes_even_when_audio_fails(self):
+        ac = Mock()
+        ac.read_text.side_effect = ['1', '0', '0']
+        commands = []
+
+        def run(*args):
+            commands.append(args)
+            if args[0] == 'pactl':
+                raise subprocess.CalledProcessError(1, args)
+            if args == ('xrandr', '--query'):
+                return 'eDP-1 connected (normal)\nDP-1 connected primary 1920x1080+0+0 (normal)'
+            return ''
+
+        with tempfile.TemporaryDirectory() as root, patch.object(
+                self.w, 'STATE', Path(root) / 'layout.json'), patch.object(
+                self.w, 'find_ac', return_value=ac), patch.object(
+                self.w, 'run', side_effect=run), patch.object(
+                self.w.time, 'sleep', side_effect=[None, None, KeyboardInterrupt]), patch(
+                'sys.argv', ['powercut-display-watch']):
+            with self.assertRaises(KeyboardInterrupt):
+                self.w.main()
+        switches = [cmd for cmd in commands if '--primary' in cmd]
+        self.assertEqual(switches, [('xrandr', '--output', 'eDP-1', '--auto', '--primary',
+                                     '--pos', '0x0', '--output', 'DP-1', '--off')])
 
 class AudioPriorityTests(unittest.TestCase):
     setUp = WatchTests.setUp

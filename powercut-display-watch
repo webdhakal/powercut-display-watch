@@ -72,11 +72,8 @@ def snapshot():
     outputs = parse_outputs(run('xrandr', '--query'))
     if not any(o['name'].startswith(('eDP', 'LVDS')) for o in outputs):
         raise RuntimeError('No laptop display found')
-    card = next(c for c in json.loads(run('pactl', '-f', 'json', 'list', 'cards')) if c['name'] == CARD)
-    sinks = json.loads(run('pactl', '-f', 'json', 'list', 'sinks'))
-    sink = run('pactl', 'get-default-sink')
-    port = next((s.get('active_port') for s in sinks if s['name'] == sink), None)
-    return {'outputs': outputs, 'profile': card['active_profile'], 'sink': sink, 'port': port}
+    # Display recovery must not depend on an audio device or sound server.
+    return {'outputs': outputs}
 
 
 def save(state):
@@ -180,7 +177,6 @@ def battery(state):
         if output != laptop:
             cmd += ['--output', output['name'], '--off']
     run(*cmd)
-    route_audio(False)
     log('Power cut: laptop display active')
 
 
@@ -192,8 +188,6 @@ def restore(state, ac):
         log('Waiting for external display to reconnect')
         return False
     run(*restore_command(state['outputs']))
-    route_audio(any(o['mode'] and not o['name'].startswith(('eDP', 'LVDS'))
-                    for o in parse_outputs(run('xrandr', '--query'))))
     log('Power restored: saved display layout restored')
     return True
 
@@ -206,8 +200,9 @@ def main():
         raise RuntimeError('This Mint version requires an X11 session')
     ac = find_ac()
     initial = snapshot()
-    log(f'Watching {ac}; displays: ' + ', '.join(o['name'] for o in initial['outputs']) + f'; audio: {initial["sink"]}')
+    log(f'Watching {ac}; displays: ' + ', '.join(o['name'] for o in initial['outputs']))
     if args.check:
+        initial['sink'] = run('pactl', 'get-default-sink')
         initial['preferred_audio'] = choose_audio(
             json.loads(run('pactl', '-f', 'json', 'list', 'cards')),
             json.loads(run('pactl', '-f', 'json', 'list', 'sinks')),
@@ -219,6 +214,7 @@ def main():
     state = json.loads(STATE.read_text()) if STATE.exists() else initial
     previous = None
     pending = None
+    pending_audio = False
     ready_at = 0
     while True:
         try:
@@ -238,6 +234,7 @@ def main():
             if pending == 'battery':
                 battery(state)
                 pending = None
+                pending_audio = True
             elif pending == 'restore' and time.monotonic() >= ready_at:
                 if restore(state, ac):
                     STATE.unlink(missing_ok=True)
@@ -247,7 +244,11 @@ def main():
             monitor_allowed = current == '1' and pending is None and any(
                 o['mode'] and not o['name'].startswith(('eDP', 'LVDS'))
                 for o in parse_outputs(run('xrandr', '--query')))
-            route_audio(monitor_allowed)
+            # Retry audio separately after display recovery has completed.
+            # Once battery audio succeeds, preserve manual output choices.
+            if current == '1' or pending_audio:
+                route_audio(monitor_allowed)
+                pending_audio = False
         except (OSError, ValueError, RuntimeError, StopIteration, subprocess.SubprocessError) as error:
             log(f'Retrying after error: {error}')
         time.sleep(2)
