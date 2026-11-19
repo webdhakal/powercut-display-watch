@@ -48,6 +48,27 @@ HDMI-1 disconnected (normal left inverted right x axis y axis)
             self.assertFalse(self.w.restore({'outputs': [], 'profile': '', 'sink': ''}, ac))
             run.assert_not_called()
 
+    def test_power_return_keeps_active_extended_layout(self):
+        laptop = 'eDP-1 connected primary 1920x1080+0+0 (normal)\n'
+        saved = self.w.parse_outputs(laptop + 'DP-1 connected 1920x1080+0+0 (normal)')
+        ac = Mock()
+        ac.read_text.return_value = '1'
+        for connector in ('DP-1', 'HDMI-1'):
+            with self.subTest(connector=connector), patch.object(
+                    self.w, 'run', return_value=laptop +
+                    f'{connector} connected 1920x1080+1920+0 (normal)') as run:
+                self.assertTrue(self.w.restore({'outputs': saved}, ac))
+                run.assert_called_once_with('xrandr', '--query')
+
+    def test_power_return_restores_saved_monitor_if_still_disabled(self):
+        laptop = 'eDP-1 connected primary 1920x1080+0+0 (normal)\n'
+        saved = self.w.parse_outputs(laptop + 'DP-1 connected 1920x1080+1920+0 (normal)')
+        ac = Mock()
+        ac.read_text.return_value = '1'
+        with patch.object(self.w, 'run', side_effect=[laptop + 'DP-1 connected (normal)', '']) as run:
+            self.assertTrue(self.w.restore({'outputs': saved}, ac))
+        self.assertIn('1920x0', run.call_args.args)
+
     def test_display_snapshot_does_not_depend_on_audio(self):
         def run(*args):
             if args[0] == 'pactl':

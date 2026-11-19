@@ -183,7 +183,15 @@ def battery(state):
 def restore(state, ac):
     if ac.read_text().strip() != '1':
         return False
-    connected = {o['name'] for o in parse_outputs(run('xrandr', '--query'))}
+    outputs = parse_outputs(run('xrandr', '--query'))
+    if any(o['mode'] and not o['name'].startswith(('eDP', 'LVDS')) for o in outputs):
+        log('Power restored: keeping the active external display layout')
+        return True
+    if not any(o['mode'] and not o['name'].startswith(('eDP', 'LVDS'))
+               for o in state['outputs']):
+        log('Power restored: no external display layout to restore')
+        return True
+    connected = {o['name'] for o in outputs}
     if any(o['mode'] and o['name'] not in connected for o in state['outputs']):
         log('Waiting for external display to reconnect')
         return False

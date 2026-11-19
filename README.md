@@ -12,9 +12,10 @@ charger manually also triggers recovery.
   Disabling the dead display keeps windows accessible on the laptop.
   After this initial switch, you can choose another output in system Sound
   settings (including the laptop speakers); your choice stays until AC returns.
-* On AC: wait five seconds for the monitor, then restore the display positions,
-  resolutions, refresh rates, rotations and primary display captured before the
-  outage. Select headphones first, then available monitor speakers, then laptop speakers.
+* On AC: keep the current layout if an external display is already active,
+  including one set up while on battery. Otherwise, wait for the saved external
+  display to return and restore its previous layout. Select headphones first,
+  then available monitor speakers, then laptop speakers.
   Move playing audio to the selected output.
 * Detect the charger's `Mains` power supply automatically (`ADP0` on this laptop).
 * Check audio connections every two seconds while on AC.
